@@ -1,0 +1,615 @@
+!pip install -q grad-cam
+!pip install -q timm
+!pip install -q captum
+!pip install -q lime
+
+import torch
+import timm
+import captum
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
+print(f"PyTorch   : {torch.__version__}")
+print(f"CUDA OK   : {torch.cuda.is_available()}")
+print(f"GPU count : {torch.cuda.device_count()}")
+for i in range(torch.cuda.device_count()):
+    print(f"  GPU {i}  : {torch.cuda.get_device_name(i)}")
+print(f"timm      : {timm.__version__}")
+print(f"captum    : {captum.__version__}")
+print(f"grad-cam  : ✅")
+import os, time, copy, warnings
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from sklearn.metrics import (classification_report, confusion_matrix,
+                              accuracy_score, precision_score,
+                              recall_score, f1_score)
+import seaborn as sns
+warnings.filterwarnings('ignore')
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import timm
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using     : {device}")
+print(f"GPU count : {torch.cuda.device_count()}")
+for i in range(torch.cuda.device_count()):
+    print(f"  GPU {i}  : {torch.cuda.get_device_name(i)}")
+BASE        = "/kaggle/input/datasets/aahantkumar/covid19dataset"
+TRAIN_PATH  = os.path.join(BASE, "COVID_19_dataset", "train")
+VAL_PATH    = os.path.join(BASE, "COVID_19_dataset", "val")
+TEST_PATH   = os.path.join(BASE, "COVID_19_dataset", "test")
+SAVE_DIR    = "/kaggle/working"
+
+IMG_SIZE    = 224
+BATCH_SIZE  = 32
+EPOCHS      = 20
+LR          = 1e-4
+NUM_CLASSES = 3
+CLASSES     = ['COVID', 'Normal', 'Viral Pneumonia']
+
+MEAN = [0.485, 0.456, 0.406]
+STD  = [0.229, 0.224, 0.225]
+
+# Verify paths
+for name, path in [("Train", TRAIN_PATH), ("Val", VAL_PATH), ("Test", TEST_PATH)]:
+    exists = os.path.exists(path)
+    count  = sum(len(os.listdir(os.path.join(path, c)))
+                 for c in os.listdir(path)) if exists else 0
+    print(f"{'✅' if exists else '❌'} {name}: {path} → {count} images")
+
+print(f"\nBatch size : {BATCH_SIZE}")
+print(f"Epochs     : {EPOCHS}")
+print(f"GPUs       : {torch.cuda.device_count()}")
+train_transforms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD)
+])
+
+val_test_transforms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD)
+])
+
+train_ds = datasets.ImageFolder(TRAIN_PATH, transform=train_transforms)
+val_ds   = datasets.ImageFolder(VAL_PATH,   transform=val_test_transforms)
+test_ds  = datasets.ImageFolder(TEST_PATH,  transform=val_test_transforms)
+
+class_counts  = np.array([len(os.listdir(os.path.join(TRAIN_PATH, c)))
+                           for c in train_ds.classes])
+class_weights = torch.tensor(1.0 / class_counts, dtype=torch.float32).to(device)
+class_weights = class_weights / class_weights.sum() * NUM_CLASSES
+
+print(f"Classes   : {train_ds.classes}")
+print(f"Class idx : {train_ds.class_to_idx}")
+print(f"Weights   : {class_weights.cpu().numpy().round(3)}")
+
+# num_workers=4 for dual GPU
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
+                          shuffle=True,  num_workers=4, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE,
+                          shuffle=False, num_workers=4, pin_memory=True)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE,
+                          shuffle=False, num_workers=4, pin_memory=True)
+
+print(f"\nTrain: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
+def build_model(model_name='efficientnet_b4', num_classes=3, pretrained=True):
+    model = timm.create_model(model_name, pretrained=pretrained,
+                               num_classes=num_classes)
+
+    # Wrap with DataParallel if multiple GPUs available
+    if torch.cuda.device_count() > 1:
+        print(f"🚀 Using {torch.cuda.device_count()} GPUs with DataParallel")
+        model = nn.DataParallel(model)
+    else:
+        print(f"Using single GPU: {torch.cuda.get_device_name(0)}")
+
+    model = model.to(device)
+
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model     : {model_name}")
+    print(f"Params    : {total:,} total | {trainable:,} trainable")
+    return model
+
+cnn_model_b4 = build_model('efficientnet_b4')
+def train_model(model, train_loader, val_loader,
+                epochs=EPOCHS, lr=LR, model_name="model"):
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    best_val_acc = 0.0
+    best_weights = copy.deepcopy(
+        model.module.state_dict() if isinstance(model, nn.DataParallel)
+        else model.state_dict()
+    )
+    history = {'train_loss': [], 'train_acc': [],
+               'val_loss':   [], 'val_acc':   []}
+
+    for epoch in range(epochs):
+        t0 = time.time()
+
+        # ── TRAIN ─────────────────────────────────────────────
+        model.train()
+        train_loss, train_correct = 0.0, 0
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss    = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss    += loss.item() * imgs.size(0)
+            train_correct += (outputs.argmax(1) == labels).sum().item()
+
+        # ── VALIDATE ──────────────────────────────────────────
+        model.eval()
+        val_loss, val_correct = 0.0, 0
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs, labels = imgs.to(device), labels.to(device)
+                outputs  = model(imgs)
+                loss     = criterion(outputs, labels)
+                val_loss    += loss.item() * imgs.size(0)
+                val_correct += (outputs.argmax(1) == labels).sum().item()
+
+        t_loss = train_loss / len(train_loader.dataset)
+        t_acc  = train_correct / len(train_loader.dataset)
+        v_loss = val_loss / len(val_loader.dataset)
+        v_acc  = val_correct / len(val_loader.dataset)
+
+        history['train_loss'].append(t_loss)
+        history['train_acc'].append(t_acc)
+        history['val_loss'].append(v_loss)
+        history['val_acc'].append(v_acc)
+
+        scheduler.step()
+
+        if v_acc > best_val_acc:
+            best_val_acc = v_acc
+            # Correctly save DataParallel models
+            state = (model.module.state_dict()
+                     if isinstance(model, nn.DataParallel)
+                     else model.state_dict())
+            best_weights = copy.deepcopy(state)
+            torch.save(state, f"{SAVE_DIR}/best_{model_name}.pth")
+            tag = "✅ saved"
+        else:
+            tag = ""
+
+        elapsed = time.time() - t0
+        print(f"Epoch [{epoch+1:02d}/{epochs}] "
+              f"T_loss:{t_loss:.3f} T_acc:{t_acc:.3f} | "
+              f"V_loss:{v_loss:.3f} V_acc:{v_acc:.3f} | "
+              f"{elapsed:.0f}s {tag}")
+
+    # Load best weights back
+    if isinstance(model, nn.DataParallel):
+        model.module.load_state_dict(best_weights)
+    else:
+        model.load_state_dict(best_weights)
+
+    print(f"\n🏆 Best Val Accuracy: {best_val_acc:.4f}")
+    return model, history
+print("=" * 55)
+print("  TRAINING: EfficientNet-B4 (CNN) — Dual GPU")
+print("=" * 55)
+
+cnn_model_b4, history_b4 = train_model(
+    cnn_model_b4, train_loader, val_loader,
+    epochs=EPOCHS, lr=LR, model_name="efficientnet_b4"
+)
+print("=" * 55)
+print("  TRAINING: DeiT-Small (Vision Transformer) — Dual GPU")
+print("=" * 55)
+
+vit_model = build_model('deit_small_patch16_224')
+
+vit_model, vit_history = train_model(
+    vit_model, train_loader, val_loader,
+    epochs=EPOCHS, lr=5e-5,
+    model_name="deit_small"
+)
+def plot_history(history, title):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+
+    axes[0].plot(history['train_loss'], label='Train', color='#e74c3c')
+    axes[0].plot(history['val_loss'],   label='Val',   color='#3498db')
+    axes[0].set_title(f"{title} — Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(history['train_acc'], label='Train', color='#e74c3c')
+    axes[1].plot(history['val_acc'],   label='Val',   color='#3498db')
+    axes[1].set_title(f"{title} — Accuracy")
+    axes[1].set_xlabel("Epoch")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f"{SAVE_DIR}/{title}_curves.png", dpi=150)
+    plt.show()
+
+plot_history(history_b4,  "EfficientNet-B4")
+plot_history(vit_history, "DeiT-Small")
+# Helper: unwrap DataParallel for inference
+def unwrap(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+# ── EVALUATE FUNCTION ─────────────────────────────────────────
+def evaluate(model, loader, model_name):
+    m = unwrap(model)
+    m.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs  = imgs.to(device)
+            preds = m(imgs).argmax(1).cpu()
+            all_preds.extend(preds.numpy())
+            all_labels.extend(labels.numpy())
+
+    print(f"\n{'='*55}")
+    print(f"  {model_name} — Test Set Results")
+    print(f"{'='*55}")
+    print(classification_report(all_labels, all_preds, target_names=CLASSES))
+
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(7, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=CLASSES, yticklabels=CLASSES)
+    plt.title(f"{model_name} — Confusion Matrix")
+    plt.ylabel("True Label")
+    plt.xlabel("Predicted Label")
+    plt.tight_layout()
+    plt.savefig(f"{SAVE_DIR}/{model_name}_confusion.png", dpi=150)
+    plt.show()
+    return all_preds, all_labels
+
+# ── TTA FUNCTION ──────────────────────────────────────────────
+def predict_with_tta(model, loader, model_name, n_augments=10):
+    m = unwrap(model)
+    m.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs        = imgs.to(device)
+            batch_probs = torch.zeros(imgs.size(0), NUM_CLASSES).to(device)
+            for _ in range(n_augments):
+                batch_probs += torch.softmax(m(imgs), dim=1)
+            batch_probs /= n_augments
+            all_probs.append(batch_probs.cpu())
+            all_labels.extend(labels.numpy())
+
+    all_probs  = torch.cat(all_probs)
+    all_preds  = all_probs.argmax(1).numpy()
+    all_labels = np.array(all_labels)
+
+    print(f"\n{'='*55}")
+    print(f"  {model_name} + TTA — Test Set Results")
+    print(f"{'='*55}")
+    print(classification_report(all_labels, all_preds, target_names=CLASSES))
+
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(7, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=CLASSES, yticklabels=CLASSES)
+    plt.title(f"{model_name} + TTA — Confusion Matrix")
+    plt.ylabel("True Label")
+    plt.xlabel("Predicted Label")
+    plt.tight_layout()
+    plt.savefig(f"{SAVE_DIR}/{model_name}_TTA_confusion.png", dpi=150)
+    plt.show()
+    return all_preds, all_labels.tolist()
+
+# ── ENSEMBLE FUNCTION ─────────────────────────────────────────
+def ensemble_predict(cnn_model, vit_model, loader, cnn_weight=0.5):
+    cnn_m = unwrap(cnn_model)
+    vit_m = unwrap(vit_model)
+    cnn_m.eval()
+    vit_m.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs      = imgs.to(device)
+            cnn_probs = torch.softmax(cnn_m(imgs), dim=1)
+            vit_probs = torch.softmax(vit_m(imgs), dim=1)
+            combined  = cnn_weight * cnn_probs + (1 - cnn_weight) * vit_probs
+            all_preds.extend(combined.argmax(1).cpu().numpy())
+            all_labels.extend(labels.numpy())
+
+    print(f"\n{'='*55}")
+    print(f"  Ensemble (B4 + ViT) — Test Set Results")
+    print(f"{'='*55}")
+    print(classification_report(all_labels, all_preds, target_names=CLASSES))
+
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(7, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=CLASSES, yticklabels=CLASSES)
+    plt.title("Ensemble (B4 + ViT) — Confusion Matrix")
+    plt.ylabel("True Label")
+    plt.xlabel("Predicted Label")
+    plt.tight_layout()
+    plt.savefig(f"{SAVE_DIR}/Ensemble_confusion.png", dpi=150)
+    plt.show()
+    return all_preds, all_labels
+
+# ── RUN ALL ───────────────────────────────────────────────────
+print("⏳ Running all evaluations...\n")
+b4_preds,      b4_labels      = evaluate(cnn_model_b4, test_loader, "EfficientNet-B4")
+b4_tta_preds,  b4_tta_labels  = predict_with_tta(cnn_model_b4, test_loader, "EfficientNet-B4")
+vit_preds,     vit_labels     = evaluate(vit_model, test_loader, "DeiT-Small")
+vit_tta_preds, vit_tta_labels = predict_with_tta(vit_model, test_loader, "DeiT-Small")
+ens_preds,     ens_labels     = ensemble_predict(cnn_model_b4, vit_model, test_loader)
+
+# ── SUMMARY TABLE ─────────────────────────────────────────────
+def metrics_row(labels, preds, name):
+    acc = accuracy_score(labels, preds)
+    pre = precision_score(labels, preds, average='macro')
+    rec = recall_score(labels, preds, average='macro')
+    f1  = f1_score(labels, preds, average='macro')
+    print(f"{name:<30} {acc:.4f}    {pre:.4f}    {rec:.4f}    {f1:.4f}")
+    return acc, pre, rec, f1
+
+print(f"\n{'='*75}")
+print(f"  FINAL METRICS SUMMARY — TEST SET")
+print(f"{'='*75}")
+print(f"{'Model':<30} {'Acc':<10} {'Precision':<12} {'Recall':<10} {'F1'}")
+print(f"{'-'*75}")
+metrics_row(b4_labels,      b4_preds,      "EfficientNet-B4")
+metrics_row(b4_tta_labels,  b4_tta_preds,  "EfficientNet-B4 + TTA")
+metrics_row(vit_labels,     vit_preds,     "DeiT-Small (ViT)")
+metrics_row(vit_tta_labels, vit_tta_preds, "DeiT-Small + TTA")
+metrics_row(ens_labels,     ens_preds,     "Ensemble (B4 + ViT)")
+print(f"{'='*75}")
+def get_test_samples(n_per_class=3):
+    """
+    Returns raw PIL images + tensors + labels
+    for n_per_class samples from each class
+    """
+    raw_imgs, tensors, labels, paths = [], [], [], []
+    for cls_idx, cls_name in enumerate(CLASSES):
+        cls_path  = os.path.join(TEST_PATH, cls_name)
+        img_files = os.listdir(cls_path)[:n_per_class]
+        for fname in img_files:
+            full_path = os.path.join(cls_path, fname)
+            img_pil   = Image.open(full_path).convert('RGB')
+            img_t     = val_test_transforms(img_pil).unsqueeze(0).to(device)
+            raw_imgs.append(img_pil)
+            tensors.append(img_t)
+            labels.append(cls_idx)
+            paths.append(full_path)
+    print(f"Loaded {len(raw_imgs)} images "
+          f"({n_per_class} per class × {len(CLASSES)} classes)")
+    return raw_imgs, tensors, labels, paths
+
+raw_imgs, tensors, labels, paths = get_test_samples(n_per_class=3)
+
+# Helper: tensor → numpy for visualization
+def tensor_to_np(t):
+    """Denormalize and convert tensor to HWC numpy array"""
+    t   = t.squeeze(0).cpu()
+    inv = transforms.Normalize(
+        mean=[-m/s for m, s in zip(MEAN, STD)],
+        std=[1/s for s in STD]
+    )
+    t = inv(t).clamp(0, 1)
+    return t.permute(1, 2, 0).numpy()
+
+# Unwrap DataParallel for all models
+cnn_unwrapped = unwrap(cnn_model_b4)
+vit_unwrapped = unwrap(vit_model)
+cnn_unwrapped.eval()
+vit_unwrapped.eval()
+
+# ── ENSEMBLE WRAPPER ──────────────────────────────────────────
+# Wraps CNN + ViT into a single callable model
+# Used for all explainability methods
+class EnsembleModel(nn.Module):
+    def __init__(self, cnn, vit, cnn_weight=0.5):
+        super().__init__()
+        self.cnn        = cnn
+        self.vit        = vit
+        self.cnn_weight = cnn_weight
+
+    def forward(self, x):
+        cnn_probs = torch.softmax(self.cnn(x), dim=1)
+        vit_probs = torch.softmax(self.vit(x), dim=1)
+        return self.cnn_weight * cnn_probs + (1 - self.cnn_weight) * vit_probs
+
+ensemble_model = EnsembleModel(cnn_unwrapped, vit_unwrapped, cnn_weight=0.5)
+ensemble_model = ensemble_model.to(device)
+ensemble_model.eval()
+
+print("✅ Test samples ready")
+print("✅ Unwrapped models ready")
+print("✅ Ensemble model wrapper ready")
+print(f"\nExplainability model : Ensemble (B4 + ViT)")
+print(f"Grad-CAM model       : EfficientNet-B4 (needs conv layers)")
+print(f"Attention Rollout    : DeiT-Small ViT  (needs attention blocks)")
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
+# Grad-CAM uses CNN component — needs conv layers
+# (ViT has no conv layers; Grad-CAM is CNN-specific)
+target_layer_cnn = [cnn_unwrapped.conv_head]
+
+def get_gradcam(model, target_layers, img_tensor, label):
+    with GradCAM(model=model, target_layers=target_layers) as cam:
+        targets   = [ClassifierOutputTarget(label)]
+        grayscale = cam(input_tensor=img_tensor, targets=targets)
+    return grayscale[0]
+
+# Generate Grad-CAM for all test samples
+gradcam_maps = []
+for img_t, lbl in zip(tensors, labels):
+    gcam = get_gradcam(cnn_unwrapped, target_layer_cnn, img_t, lbl)
+    gradcam_maps.append(gcam)
+
+# Visualize
+fig, axes = plt.subplots(2, len(raw_imgs), figsize=(len(raw_imgs) * 3, 6))
+for i in range(len(raw_imgs)):
+    np_img   = tensor_to_np(tensors[i])
+    heatmap  = show_cam_on_image(np_img, gradcam_maps[i], use_rgb=True)
+    cls_name = CLASSES[labels[i]]
+
+    axes[0][i].imshow(np_img)
+    axes[0][i].set_title(f"Original\n{cls_name}", fontsize=8)
+    axes[0][i].axis('off')
+
+    axes[1][i].imshow(heatmap)
+    axes[1][i].set_title(f"Grad-CAM\n{cls_name}", fontsize=8)
+    axes[1][i].axis('off')
+
+plt.suptitle("Grad-CAM — EfficientNet-B4 (CNN component of Ensemble)",
+             fontsize=12, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{SAVE_DIR}/gradcam.png", dpi=150)
+plt.show()
+print("✅ Grad-CAM done")
+def attention_rollout(model, img_tensor):
+    """
+    Attention Rollout across all transformer layers.
+    Temporarily patches the attention forward pass to bypass Flash Attention,
+    keeping computations on the GPU for optimal time and space complexity.
+    """
+    model.eval()
+    attn_weights_list = []
+    original_forwards = {}
+
+    def get_patched_forward(module):
+        # Added **kwargs to catch 'attn_mask' and 'is_causal' 
+        def patched_forward(x, **kwargs):
+            B, N, C = x.shape
+            # Standard timm ViT qkv projection
+            qkv = module.qkv(x).reshape(B, N, 3, module.num_heads, module.head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+
+            # Manual attention calculation
+            q = q * module.scale
+            attn = (q @ k.transpose(-2, -1))
+            attn = attn.softmax(dim=-1)
+
+            # Capture weights (detached, kept on GPU)
+            attn_weights_list.append(attn.detach())
+
+            attn = module.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            x = module.proj(x)
+            x = module.proj_drop(x)
+            return x
+        return patched_forward
+
+    # 1. Apply temporary patches to intercept the weights
+    for i, block in enumerate(model.blocks):
+        original_forwards[i] = block.attn.forward
+        block.attn.forward = get_patched_forward(block.attn)
+
+    # 2. Run inference
+    with torch.no_grad():
+        _ = model(img_tensor)
+
+    # 3. Clean up: Restore original model structure immediately
+    for i, block in enumerate(model.blocks):
+        block.attn.forward = original_forwards[i]
+
+    if not attn_weights_list:
+        print("⚠️ Fallback attention")
+        return np.ones((14, 14))
+
+    # 4. Rollout computation (GPU Accelerated)
+    device = img_tensor.device
+    result = torch.eye(attn_weights_list[0].shape[-1], device=device)
+    
+    for attn in attn_weights_list:
+        attn_avg = attn.mean(dim=1).squeeze(0)
+        attn_aug = attn_avg + torch.eye(attn_avg.shape[0], device=device)
+        attn_aug = attn_aug / attn_aug.sum(dim=-1, keepdim=True)
+        result   = torch.matmul(attn_aug, result)
+
+    # Extract class token attention to all other patches
+    mask = result[0, 1:]
+    h = w = int(mask.shape[0] ** 0.5)
+    
+    # 5. Move final small mask to CPU for rendering
+    mask = mask.reshape(h, w).cpu().numpy()
+    mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)
+    return mask
+
+# Generate Attention Rollout maps
+rollout_maps = []
+for img_t in tensors:
+    rollout = attention_rollout(vit_unwrapped, img_t)
+    rollout_up = np.array(
+        Image.fromarray((rollout * 255).astype(np.uint8))
+             .resize((IMG_SIZE, IMG_SIZE))
+    ) / 255.0
+    rollout_maps.append(rollout_up)
+
+# Visualize
+fig, axes = plt.subplots(2, len(raw_imgs), figsize=(len(raw_imgs) * 3, 6))
+for i in range(len(raw_imgs)):
+    np_img   = tensor_to_np(tensors[i])
+    overlay  = show_cam_on_image(np_img, rollout_maps[i], use_rgb=True)
+    cls_name = CLASSES[labels[i]]
+
+    axes[0][i].imshow(np_img)
+    axes[0][i].set_title(f"Original\n{cls_name}", fontsize=8)
+    axes[0][i].axis('off')
+
+    axes[1][i].imshow(overlay)
+    axes[1][i].set_title(f"Attn Rollout\n{cls_name}", fontsize=8)
+    axes[1][i].axis('off')
+
+plt.suptitle("Attention Rollout — DeiT-Small (ViT)", fontsize=13, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{SAVE_DIR}/attention_rollout.png", dpi=150)
+plt.show()
+print("✅ Attention Rollout done")
+from captum.attr import IntegratedGradients
+
+ig      = IntegratedGradients(cnn_unwrapped)
+ig_maps = []
+
+for img_t, lbl in zip(tensors, labels):
+    baseline = torch.zeros_like(img_t).to(device)
+    attrs    = ig.attribute(img_t, baseline, target=lbl, n_steps=50)
+    attrs_np = attrs.squeeze(0).cpu().detach().numpy()
+    attrs_np = np.mean(np.abs(attrs_np), axis=0)
+    attrs_np = (attrs_np - attrs_np.min()) / (attrs_np.max() - attrs_np.min() + 1e-8)
+    ig_maps.append(attrs_np)
+
+# Visualize
+fig, axes = plt.subplots(2, len(raw_imgs), figsize=(len(raw_imgs) * 3, 6))
+for i in range(len(raw_imgs)):
+    np_img   = tensor_to_np(tensors[i])
+    overlay  = show_cam_on_image(np_img, ig_maps[i], use_rgb=True)
+    cls_name = CLASSES[labels[i]]
+
+    axes[0][i].imshow(np_img)
+    axes[0][i].set_title(f"Original\n{cls_name}", fontsize=8)
+    axes[0][i].axis('off')
+
+    axes[1][i].imshow(overlay)
+    axes[1][i].set_title(f"Integ. Grads\n{cls_name}", fontsize=8)
+    axes[1][i].axis('off')
+
+plt.suptitle("Integrated Gradients — EfficientNet-B4", fontsize=13, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{SAVE_DIR}/integrated_gradients.png", dpi=150)
+plt.show()
+print("✅ Integrated Gradients done")
