@@ -56,37 +56,37 @@ This project trains two deep learning models on a balanced 3-class chest X-ray d
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
               ┌─────────────────▼──────────────────┐
-              │         DATA PREPROCESSING          │
-              │  • Resize → 224×224                 │
-              │  • Normalize (ImageNet stats)        │
-              │  • Train Augmentation:               │
-              │    – RandomHorizontalFlip (p=0.5)    │
-              │    – RandomRotation ±10°             │
-              │    – ColorJitter (b/c ±0.2)          │
-              └────────┬──────────────┬─────────────┘
+              │         DATA PREPROCESSING         │
+              │  • Resize → 224×224                │
+              │  • Normalize (ImageNet stats)      │
+              │  • Train Augmentation:             │
+              │    – RandomHorizontalFlip (p=0.5)  │
+              │    – RandomRotation ±10°           │
+              │    – ColorJitter (b/c ±0.2)        │
+              └────────┬──────────────┬────────────┘
                        │              │
-         ┌─────────────▼──┐      ┌────▼──────────────┐
-         │  EfficientNet-B4│      │   DeiT-Small       │
+         ┌─────────────▼───┐      ┌────▼────────────────┐
+         │  EfficientNet-B4│      │   DeiT-Small        │
          │  (CNN Backbone) │      │ (Vision Transformer)│
-         │                 │      │                    │
-         │  Compound Scale │      │  Patch Size: 16    │
-         │  17.55M params  │      │  21.67M params     │
-         │  ~36s / epoch   │      │  ~22s / epoch      │
-         │                 │      │                    │
-         │  Conv Layers ──►│      │  12 Attn Blocks ──►│
-         │  Global AvgPool │      │  [CLS] Token       │
-         │  FC Head (×3)   │      │  FC Head (×3)      │
-         └────────┬────────┘      └────────┬───────────┘
-                  │  Softmax probs          │  Softmax probs
+         │                 │      │                     │
+         │  Compound Scale │      │  Patch Size: 16     │
+         │  17.55M params  │      │  21.67M params      │
+         │  ~36s / epoch   │      │  ~22s / epoch       │
+         │                 │      │                     │
+         │  Conv Layers ──►│      │  12 Attn Blocks ──► │
+         │  Global AvgPool │      │  [CLS] Token        │
+         │  FC Head (×3)   │      │  FC Head (×3)       │
+         └────────┬────────┘      └────────┬────────────┘
+                  │  Softmax probs         │  Softmax probs
                   └──────────┬─────────────┘
                              │
-              ┌──────────────▼──────────────┐
+              ┌──────────────▼───────────────┐
               │     ENSEMBLE (Soft Vote)     │
               │   avg(p_CNN + p_ViT) / 2     │
               │   + Test-Time Augmentation   │
-              │                             │
+              │                              │
               │   ✅ 99.08% Test Accuracy    │
-              └──────────────┬──────────────┘
+              └──────────────┬───────────────┘
                              │
               ┌──────────────▼──────────────────────────────┐
               │         EXPLAINABILITY MODULE               │
