@@ -88,25 +88,25 @@ This project trains two deep learning models on a balanced 3-class chest X-ray d
               │   ✅ 99.08% Test Accuracy    │
               └──────────────┬───────────────┘
                              │
-              ┌──────────────▼──────────────────────────────┐
-              │         EXPLAINABILITY MODULE               │
-              │                                             │
+              ┌──────────────▼─────────────────────────────┐
+              │         EXPLAINABILITY MODULE              │
+              │                                            │
               │  ┌─────────────┐   ┌────────────────────┐  │
-              │  │  CNN-based  │   │    ViT-based        │  │
-              │  │  Grad-CAM   │   │  Attention Rollout  │  │
+              │  │  CNN-based  │   │    ViT-based       │  │
+              │  │  Grad-CAM   │   │  Attention Rollout │  │
               │  └─────────────┘   └────────────────────┘  │
-              │                                             │
-              │  ┌─────────────┐   ┌──────┐   ┌────────┐  │
-              │  │  Integrated │   │ LIME │   │  SHAP  │  │
-              │  │  Gradients  │   │      │   │        │  │
-              │  └─────────────┘   └──────┘   └────────┘  │
-              │                                             │
+              │                                            │
+              │  ┌─────────────┐   ┌──────┐   ┌────────┐   │
+              │  │  Integrated │   │ LIME │   │  SHAP  │   │
+              │  │  Gradients  │   │      │   │        │   │
+              │  └─────────────┘   └──────┘   └────────┘   │
+              │                                            │
               │  ┌─────────────────────────────────────┐   │
-              │  │  🆕 UWSA / PACS-UWSA (Proposed)     │   │
-              │  │  Uncertainty-Weighted Synergistic    │   │
+              │  │  🆕 UWSA / PACS-UWSA (Proposed)    |   │
+              │  │  Uncertainty-Weighted Synergistic   │   │
               │  │  Aggregation                        │   │
               │  └─────────────────────────────────────┘   │
-              └──────────────┬──────────────────────────────┘
+              └──────────────┬─────────────────────────────┘
                              │
               ┌──────────────▼──────────────┐
               │    QUANTITATIVE EVALUATION  │
